@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+credentials.json
+token.json
+
+#nao sobe arquivos 
