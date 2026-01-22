@@ -1,4 +1,4 @@
-import os
+﻿import os
 import datetime
 import logging
 from google.auth.transport.requests import Request
@@ -7,23 +7,26 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build, Resource
 from googleapiclient.errors import HttpError
 
-#Log Padrao
 from logger_config import Log
 
-#Log especifico pro modulo
 log_setup = Log("BotLog")
 logger = log_setup.get_logger("AgendaGoogle")
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-
-# Variável global para armazenar a conexão (Cache)
-# Isso evita conectar no Google toda vez que alguém manda mensagem
 _SERVICE_CACHE = None
+
+# Define fuso horário fixo (Brasil/São Paulo)
+SAO_PAULO_TZ = datetime.timezone(datetime.timedelta(hours=-3))
+
+def _to_rfc3339(dt: datetime.datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=SAO_PAULO_TZ)
+    return dt.isoformat()
 
 def autenticar_google() -> Resource:
     global _SERVICE_CACHE
-    
-    # Retorna o serviço em cache se já autenticado
+
+    # Se já tiver conexão em memória e o token não expirou, usa ela
     if _SERVICE_CACHE:
         return _SERVICE_CACHE
 
@@ -32,120 +35,149 @@ def autenticar_google() -> Resource:
     caminho_token = os.path.join(pasta_atual, "token.json")
 
     creds = None
-    
+
     try:
+        # 1. Tenta carregar o token existente (que o site gerou ou o login anterior gerou)
         if os.path.exists(caminho_token):
             creds = Credentials.from_authorized_user_file(caminho_token, SCOPES)
-        
+
+        # 2. Valida o token
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                logger.info("Token expirado. Atualizando credenciais...")
+                logger.info("Token expirado. Tentando renovar automaticamente...")
                 creds.refresh(Request())
             else:
-                logger.info("Iniciando novo fluxo de autenticação (OAuth)...")
+                # Se não tem token, precisamos logar.
+                # Nota: Em produção (servidor), isso aqui falharia se tentasse abrir navegador.
+                # Mas como temos o login via Site agora, o token.json deve existir.
+                logger.info("Token inválido ou inexistente. Tentando fluxo local...")
+                
                 if not os.path.exists(caminho_credentials):
-                    error_msg = f"Arquivo credentials.json não encontrado em: {caminho_credentials}"
-                    logger.critical(error_msg)
-                    raise FileNotFoundError(error_msg)
+                    raise FileNotFoundError("Arquivo credentials.json não encontrado!")
 
                 flow = InstalledAppFlow.from_client_secrets_file(caminho_credentials, SCOPES)
                 creds = flow.run_local_server(port=0)
-            
-            #token
+
+            # Salva o token renovado/novo
             with open(caminho_token, "w") as token:
                 token.write(creds.to_json())
-        
-        #Salvando o serviço no cache global
+
         _SERVICE_CACHE = build("calendar", "v3", credentials=creds)
-        logger.info("Conexão com Google Calendar estabelecida com sucesso.")
         return _SERVICE_CACHE
 
     except Exception as e:
-        logger.error(f"Falha crítica na autenticação: {e}")
-        raise
+        logger.error(f"Falha crítica na autenticação Google: {e}")
+        # Reseta o cache para forçar nova tentativa na próxima
+        _SERVICE_CACHE = None
+        raise e
 
-def listar_proximos_eventos() -> str:
-    #listanda 10 eventos da agenda, caso queira mudar so mudar a variavel maxResults
+def listar_proximos_eventos(calendar_id: str = "primary") -> str:
     try:
         service = autenticar_google()
-        agora = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
         
+        # Pega hora atual em UTC e formata para o padrão do Google
+        agora = datetime.datetime.utcnow().isoformat() + "Z"
+
         events_result = service.events().list(
-            calendarId="primary", 
+            calendarId=calendar_id,
             timeMin=agora,
-            maxResults=10, 
+            maxResults=10,
             singleEvents=True,
             orderBy="startTime"
         ).execute()
-        
+
         events = events_result.get("items", [])
 
         if not events:
-            return "A agenda está totalmente livre nos próximos dias."
+            return f"A agenda ({calendar_id}) está livre nos próximos dias."
 
-        resposta = "📅 **Horários já Ocupados:**\n"
+        resposta = f"📅 Agenda ({calendar_id}):\n"
         for event in events:
             start = event["start"].get("dateTime", event["start"].get("date"))
-            
-            #Formataçao da data
             try:
+                # Tenta formatar bonitinho
                 data_obj = datetime.datetime.fromisoformat(start)
                 data_formatada = data_obj.strftime("%d/%m às %H:%M")
-            except ValueError:
-                data_formatada = start #Se nao conseguir formatar, deixa o original
+            except:
+                data_formatada = start
 
-            resposta += f"- {data_formatada}: {event['summary']}\n"
-        
+            resposta += f"- {data_formatada}: {event.get('summary', 'Ocupado')}\n"
+
         return resposta
 
     except HttpError as error:
-        logger.error(f"Erro de API ao listar eventos: {error}")
-        return "Erro ao consultar a agenda no Google."
+        logger.error(f"Erro de API ao listar eventos ({calendar_id}): {error}")
+        return "Erro de permissão ou conexão ao consultar a agenda."
     except Exception as e:
         logger.error(f"Erro inesperado ao listar: {e}")
         return "Erro técnico ao acessar agenda."
 
-def criar_evento_agenda(data_hora_iso: str, nome_cliente: str) -> str:
+def criar_evento_agenda(data_hora_iso: str, nome_cliente: str, calendar_id: str = "primary", duracao_min: int = 45) -> str:
+    """
+    Cria o evento e retorna UMA STRING de sucesso ou lança EXCEÇÃO se falhar.
+    """
     try:
+        # 1. Parsing da data
         try:
             inicio_dt = datetime.datetime.fromisoformat(data_hora_iso)
         except ValueError:
-            logger.warning(f"Formato de data inválido recebido: {data_hora_iso}")#Evita crash no bot caso a data venha errada
-            return "Erro: Data em formato inválido. Use AAAA-MM-DDTHH:MM:SS"
+            raise ValueError("Formato de data inválido fornecido pela IA.")
 
         service = autenticar_google()
         
-        # Fim do evento 1 hora depois do início, variavel hours pode ser alterada para mudar a duraçao padrao
-        fim_dt = inicio_dt + datetime.timedelta(hours=1)
-        
+        # Calcula fim do corte
+        fim_dt = inicio_dt + datetime.timedelta(minutes=duracao_min)
+
         event_body = {
-            'summary': f'Cliente: {nome_cliente}',
-            'location': 'Barbearia/Petshop', #Generico para teste
-            'description': 'Agendamento automático via Chatbot WhatsApp',
-            'start': {
-                'dateTime': data_hora_iso,
-                'timeZone': 'America/Sao_Paulo',
+            "summary": f"✂️ {nome_cliente}",
+            "description": "Agendado via Victor AI (WhatsApp)",
+            "start": {
+                "dateTime": inicio_dt.isoformat(), 
+                "timeZone": "America/Sao_Paulo"
             },
-            'end': {
-                'dateTime': fim_dt.isoformat(),
-                'timeZone': 'America/Sao_Paulo',
+            "end": {
+                "dateTime": fim_dt.isoformat(), 
+                "timeZone": "America/Sao_Paulo"
+            },
+            "reminders": {
+                "useDefault": False,
+                "overrides": [
+                    {"method": "popup", "minutes": 30},
+                ],
             },
         }
 
-        logger.info(f"Tentando agendar para {nome_cliente} às {data_hora_iso}")
+        logger.info(f"Enviando agendamento para Calendar ID: {calendar_id}")
         
-        event = service.events().insert(calendarId='primary', body=event_body).execute()
+        event = service.events().insert(
+            calendarId=calendar_id, 
+            body=event_body
+        ).execute()
         
-        link = event.get('htmlLink')
-        logger.info(f"Evento criado com sucesso: {link}")
-        return f"✅ Agendado com sucesso para {nome_cliente}! Verifique aqui: {link}"
+        link = event.get("htmlLink")
+        return f"✅ Agendamento confirmado!\n📅 {inicio_dt.strftime('%d/%m às %H:%M')}\n🔗 Ver no Google: {link}"
 
     except HttpError as error:
-        logger.error(f"Erro da Google API ao criar evento: {error}")
-        return f"Falha no Google Agenda: {error}"
+        # Se o erro for 404, o email do barbeiro está errado ou não existe
+        if error.resp.status == 404:
+            logger.error(f"Calendário não encontrado: {calendar_id}")
+            raise Exception(f"Não encontrei a agenda do e-mail {calendar_id}. Verifique o cadastro.")
+        
+        # Se o erro for 403, falta permissão
+        if error.resp.status == 403:
+            logger.error(f"Sem permissão no calendário: {calendar_id}")
+            raise Exception(f"O barbeiro ({calendar_id}) precisa aceitar o convite de compartilhamento da agenda.")
+
+        logger.error(f"Erro Google API: {error}")
+        raise Exception(f"Erro no Google Agenda: {error}")
+
     except Exception as e:
         logger.error(f"Erro genérico ao agendar: {e}")
-        return "Ocorreu um erro interno ao tentar agendar."
+        raise e
 
 if __name__ == "__main__":
-    print(listar_proximos_eventos())
+    # Teste rápido se rodar direto o arquivo
+    try:
+        print(listar_proximos_eventos())
+    except Exception as e:
+        print(f"Erro no teste: {e}")

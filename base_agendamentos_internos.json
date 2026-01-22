@@ -1,0 +1,22 @@
+{
+    "victorcdiniz20@gmail.com": [
+        {
+            "id": "05deffaf-e7fe-4998-969b-114ff08c1bd3",
+            "barbeiro": "Lucas",
+            "start": "2026-01-21T14:00:00",
+            "title": "seu nome - Lucas",
+            "cliente": "seu nome"
+        },
+        {
+            "id": "36a48123-b34e-4797-8c77-3f2e704105c7",
+            "barbeiro": "Lucas",
+            "start": "2026-01-24T15:00:00",
+            "title": "Voce - Lucas",
+            "cliente": "Voce",
+            "servico": "Agendamento",
+            "duracao": 30,
+            "google_event_id": null,
+            "calendar_id": null
+        }
+    ]
+}

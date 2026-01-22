@@ -1,0 +1,14 @@
+{
+    "corte": {
+        "preco": 40.0,
+        "duracao": 45
+    },
+    "Luzes": {
+        "preco": 200.0,
+        "duracao": 120
+    },
+    "barba": {
+        "preco": 40.0,
+        "duracao": 45
+    }
+}
